@@ -1,37 +1,58 @@
 const Module = require("node:module");
 const { dirname, join } = require("node:path");
-const { pathToFileURL } = require("node:url");
+const { fileURLToPath, pathToFileURL } = require("node:url");
 
-const { logDebug, updateDDTags } = require("../utils");
+const { logDebug } = require("../utils");
+const { resolveTracerPath } = require("./tracer");
 
-const ddTraceLoaderPattern = /dd-trace[\\/](?:[^\s]*\.mjs|register\.js)/;
+let loaderRegistration;
 
-function esmLoaderAlreadyRegistered() {
-    const nodeOptions = process.env.NODE_OPTIONS;
-    if (nodeOptions !== undefined && ddTraceLoaderPattern.test(nodeOptions)) {
-        return true;
+function preloadPaths(arguments_, flags) {
+    const paths = [];
+    for (let index = 0; index < arguments_.length; index++) {
+        const argument = arguments_[index];
+        const separator = argument.indexOf("=");
+        const flag = separator === -1 ? argument : argument.slice(0, separator);
+        if (!flags.includes(flag)) continue;
+        const value = separator === -1 ? arguments_[++index] : argument.slice(separator + 1);
+        if (value !== undefined) paths.push(value.replace(/^"|"$/g, ""));
     }
+    return paths;
+}
 
-    for (const argument of process.execArgv) {
-        if (ddTraceLoaderPattern.test(argument)) {
-            return true;
-        }
+function isSelectedLoader(specifier, tracerDirectory, filename) {
+    try {
+        const path = specifier.startsWith("file:") ? fileURLToPath(specifier) : specifier;
+        return require.resolve(path, { paths: [process.cwd()] }) === join(tracerDirectory, filename);
+    } catch {
+        return false;
     }
-
-    return false;
 }
 
 /**
  * @param {string} tracerPath
  */
-function registerESMLoaderHooks(tracerPath) {
-    if (typeof Module.register !== "function" || esmLoaderAlreadyRegistered()) {
+async function registerESMLoaderHooks(tracerPath) {
+    if (typeof Module.register !== "function") {
         return;
     }
 
     const tracerDirectory = dirname(tracerPath);
     const registerPath = join(tracerDirectory, "register.js");
+    if (require.cache[registerPath]?.loaded) return;
+    const nodeOptions = process.env.NODE_OPTIONS?.match(/(?:[^\s"]+|"[^"]*")+/g) || [];
+    const arguments_ = [...nodeOptions, ...process.execArgv];
+    const loaders = preloadPaths(arguments_, ["--loader", "--experimental-loader"]);
+    if (loaders.some((specifier) => ["loader-hook.mjs", "initialize.mjs"].some(
+        (filename) => isSelectedLoader(specifier, tracerDirectory, filename),
+    ))) return;
+
+    const imports = preloadPaths(arguments_, ["--import"]);
     try {
+        if (imports.some((specifier) => isSelectedLoader(specifier, tracerDirectory, "initialize.mjs"))) {
+            await import(pathToFileURL(join(tracerDirectory, "initialize.mjs")).href);
+            return;
+        }
         try {
             require(registerPath);
         } catch (error) {
@@ -54,22 +75,19 @@ exports.import = function (path) {
     return import(path);
 }
 
-exports.initTracer = function () {
+exports.initTracer = async function () {
     // Looks for the function local version of dd-trace first, before using
     // the version provided by the layer
-    const searchPaths = ["/var/task/node_modules", ...module.paths];
-    const tracerPath = require.resolve("dd-trace", { paths: searchPaths });
-    // tslint:disable-next-line:no-var-requires
-    // add lambda tags to DD_TAGS environment variable
-    const ddtags = updateDDTags({"_dd.origin": "lambda"})
-    const tracer = require(tracerPath).init({tags: ddtags});
+    const tracerPath = resolveTracerPath();
+    // `_dd.origin: lambda` is set by the dd-trace Lambda plugin on the span
+    // itself now, so there is nothing to inject into DD_TAGS here.
+    const tracer = require(tracerPath).init();
     logDebug("automatically initialized dd-trace");
 
-    // Configure the tracer to ignore HTTP calls made from the Lambda Library to the Extension
-    tracer.use("http", {
-        blocklist: /:8124\/lambda/,
-    });
+    // The extension blocklist moved into the dd-trace Lambda plugin defaults:
+    // dd-trace owns which of its own HTTP calls it traces.
     // The durable runtime ignores NODE_OPTIONS, so install hooks explicitly.
-    registerESMLoaderHooks(tracerPath);
+    loaderRegistration ||= registerESMLoaderHooks(tracerPath);
+    await loaderRegistration;
     return tracer;
 }

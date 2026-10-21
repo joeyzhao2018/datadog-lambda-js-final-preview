@@ -57,7 +57,7 @@ function emitLog(
   error?: Error,
 ) {
   message = `datadog:${message}`;
-  let output = { status, message };
+  let output: Record<string, unknown> = { status, message };
   if (metadata instanceof Error && error === undefined) {
     // allow for log*(message), log*("message", metadata), log*("message", error), and log*("message", metadata, error)
     error = metadata;
@@ -67,8 +67,10 @@ function emitLog(
     output = { ...output, ...metadata };
   }
   if (error !== undefined) {
-    const errorInfo = serializeError(error);
-    output = { ...output, ...errorInfo };
+    // Nested, not spread: spreading let the error's `message` replace ours.
+    output = { ...output, error: serializeError(error) };
   }
-  outputter(JSON.stringify(output));
+  // An Error inside metadata (`{ error }`) would otherwise stringify as `{}`,
+  // since its message and stack are not enumerable.
+  outputter(JSON.stringify(output, (_key, value) => (value instanceof Error ? serializeError(value) : value)));
 }

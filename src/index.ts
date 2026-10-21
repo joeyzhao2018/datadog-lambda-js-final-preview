@@ -1,35 +1,19 @@
 import { Context, Handler } from "aws-lambda";
-import { HANDLER_STREAMING, STREAM_RESPONSE } from "./constants";
-import {
-  incrementErrorsMetric,
-  incrementInvocationsMetric,
-  incrementBatchItemFailureMetric,
-  KMSService,
-  MetricsConfig,
-  MetricsListener,
-  MetricsQueue,
-} from "./metrics";
-import { TraceConfig, TraceListener } from "./trace";
-import { subscribeToDC } from "./runtime";
-import {
-  isBatchItemFailure,
-  batchItemFailureCount,
-  logDebug,
-  Logger,
-  LogLevel,
-  promisifiedHandler,
-  setSandboxInit,
-  setLogger,
-  setLogLevel,
-  isManagedInstancesMode,
-} from "./utils";
-import { getEnhancedMetricTags } from "./metrics/enhanced-metrics";
-import { DatadogTraceHeaders } from "./trace/context/extractor";
-import { SpanWrapper } from "./trace/span-wrapper";
-import { SpanOptions, TracerWrapper } from "./trace/tracer-wrapper";
 
-// Backwards-compatible export, TODO deprecate in next major
-export { DatadogTraceHeaders as TraceHeaders } from "./trace/context/extractor";
+import { getLambdaFacade, LambdaConfig, TraceHeaders } from "./facade";
+import { Logger, LogLevel, setLogger, setLogLevel } from "./utils";
+
+// Backwards-compatible type export, TODO deprecate in next major.
+export { TraceHeaders };
+export { Logger, LogLevel, setLogger, setLogLevel } from "./utils";
+
+// ---------------------------------------------------------------------------
+// Environment-variable constants.
+//
+// These stay here because they are part of the published surface: onboarding
+// tooling, the Serverless Framework plugin and the CDK constructs import them
+// by name. dd-trace owns what the variables *do*; the shim owns their spelling.
+// ---------------------------------------------------------------------------
 export const apiKeyEnvVar = "DD_API_KEY";
 export const apiKeyKMSEnvVar = "DD_KMS_API_KEY";
 export const apiKeySecretARNEnvVar = "DD_API_KEY_SECRET_ARN";
@@ -56,33 +40,83 @@ export const addSpanPointersEnvVar = "DD_TRACE_AWS_ADD_SPAN_POINTERS";
 export const dataStreamsEnabledEnvVar = "DD_DATA_STREAMS_ENABLED";
 export const appsecEnabledEnvVar = "DD_APPSEC_ENABLED";
 
+// Applied at import, not in `datadog()`: the layer's startup logs (tracer init,
+// loader registration, extractor loading) all run before the handler is
+// wrapped. Same reading as 12.x — only "debug" turns debug logs on — and an
+// explicit `debugLogging` passed to `datadog()` still wins.
+if (getEnvValue(logLevelEnvVar, "ERROR").toLowerCase() === "debug") {
+  setLogLevel(LogLevel.DEBUG);
+}
+
 interface GlobalConfig {
-  /**
-   * Whether to log extra information.
-   * @default false
-   */
+  /** Whether to log extra information. @default false */
   debugLogging: boolean;
-  /**
-   * Whether to force the `datadog()` wrapper to always wrap.
-   * @default false
-   */
+  /** Whether to force the `datadog()` wrapper to always wrap. @default false */
   forceWrap: boolean;
-  /**
-   * Custom logger.
-   */
+  /** Custom logger used by the shim-owned loader and failure path. */
   logger?: Logger;
+  /** Custom trace-context extractor, loaded by the shim from `DD_TRACE_EXTRACTOR`. */
+  traceExtractor?: (event: any, context: Context) => Promise<TraceHeaders> | TraceHeaders;
 }
 
 /**
- * Configuration options for Datadog's lambda wrapper.
+ * Configuration options for Datadog's Lambda wrapper.
+ *
+ * Every field is forwarded to dd-trace, which owns the behaviour and the
+ * environment-variable fallbacks. Fields are kept optional and additive: this
+ * type is a compatibility surface, so a field is never removed in a minor.
  */
-export type Config = MetricsConfig & TraceConfig & GlobalConfig;
+export type Config = Partial<LambdaConfig> & Partial<GlobalConfig>;
 
+/**
+ * Wraps an AWS Lambda handler to add Datadog tracing and metrics.
+ *
+ * The heavy lifting happens in dd-trace. This function exists so that
+ * `import { datadog } from "datadog-lambda-js"` keeps working, and so that
+ * manual wrapping stays a supported entry point alongside the layer.
+ *
+ * ```javascript
+ * const { datadog } = require("datadog-lambda-js");
+ * exports.handler = datadog(async (event) => ({ statusCode: 200 }));
+ * ```
+ */
+export function datadog<TEvent, TResult>(
+  handler: Handler<TEvent, TResult> | any,
+  config?: Config,
+): Handler<TEvent, TResult> | any {
+  // Applied before delegating so that shim-owned logs (handler resolution,
+  // loader registration) honour the caller's intent too, not just dd-trace's.
+  if (config?.debugLogging !== undefined) {
+    setLogLevel(config.debugLogging ? LogLevel.DEBUG : LogLevel.ERROR);
+  }
+  if (config?.logger !== undefined) {
+    setLogger(config.logger);
+  }
+
+  return getLambdaFacade().wrap(handler, config);
+}
+
+/** Submits a custom distribution metric. */
+export function sendDistributionMetric(name: string, value: number, ...tags: string[]): void {
+  getLambdaFacade().sendDistributionMetric(name, value, ...tags);
+}
+
+/** Submits a custom distribution metric with an explicit timestamp. */
+export function sendDistributionMetricWithDate(name: string, value: number, metricTime: Date, ...tags: string[]): void {
+  getLambdaFacade().sendDistributionMetricWithDate(name, value, metricTime, ...tags);
+}
+
+/**
+ * The historical default configuration.
+ *
+ * dd-trace owns the live defaults now, so this is a frozen record of the values
+ * the shim used to apply, kept because `datadog(handler, { ...defaultConfig, x })`
+ * is a documented pattern. Reading it is safe; it no longer drives behaviour.
+ */
 export const defaultConfig: Config = {
   apiKey: "",
   apiKeyKMS: "",
   apiKeySecretARN: "",
-  autoPatchHTTP: true,
   captureLambdaPayload: false,
   captureLambdaPayloadMaxDepth: 10,
   createInferredSpan: true,
@@ -94,7 +128,6 @@ export const defaultConfig: Config = {
   injectLogContext: true,
   logForwarding: false,
   mergeDatadogXrayTraces: false,
-  shouldRetryMetrics: false,
   siteURL: "",
   minColdStartTraceDuration: 3,
   coldStartTraceSkipLib: "",
@@ -102,399 +135,53 @@ export const defaultConfig: Config = {
   addSpanPointers: true,
   dataStreamsEnabled: false,
   appsecEnabled: false,
-} as const;
-
-export const _metricsQueue: MetricsQueue = new MetricsQueue();
-
-let currentMetricsListener: MetricsListener | undefined;
-let currentTraceListener: TraceListener | undefined;
-
-// Skip cold start tracing subscription in managed instances mode
-// In managed instances, the tracer library handles cold start independently
-if (getEnvValue(coldStartTracingEnvVar, "true").toLowerCase() === "true" && !isManagedInstancesMode()) {
-  subscribeToDC();
-}
-
-const initTime = Date.now();
+};
 
 /**
- * Wraps your AWS lambda handler functions to add tracing/metrics support
- * @param handler A lambda handler function.
- * @param config Configuration options for datadog.
- * @returns A wrapped handler function.
+ * Splits Lambda handler arguments into their named parts.
  *
- * ```javascript
- * import { datadog } from 'datadog-lambda-js';
- * function yourHandler(event) {}
- * exports.yourHandler = datadog(yourHandler);
- * ```
- */
-export function datadog<TEvent, TResult>(
-  handler: Handler<TEvent, TResult> | any,
-  config?: Partial<Config>,
-): Handler<TEvent, TResult> | any {
-  const finalConfig = getConfig(config);
-  const metricsListener = new MetricsListener(new KMSService(), finalConfig);
-
-  const traceListener = new TraceListener(finalConfig);
-
-  // Only wrap the handler once unless forced
-  const _ddWrappedKey = "_ddWrapped";
-  if ((handler as any)[_ddWrappedKey] !== undefined && !finalConfig.forceWrap) {
-    return handler;
-  }
-
-  setLogLevel(finalConfig.debugLogging ? LogLevel.DEBUG : LogLevel.ERROR);
-  if (finalConfig.logger) {
-    setLogger(finalConfig.logger);
-  }
-
-  const isResponseStreamFunction =
-    handler[HANDLER_STREAMING] !== undefined && handler[HANDLER_STREAMING] === STREAM_RESPONSE;
-  const promHandler: any = promisifiedHandler(handler);
-
-  let wrappedFunc: any;
-  wrappedFunc = async (...args: any[]) => {
-    const { event, context, responseStream } = extractArgs(isResponseStreamFunction, ...args);
-    const startTime = new Date();
-    setSandboxInit(initTime, startTime.getTime());
-
-    currentMetricsListener = metricsListener;
-    currentTraceListener = traceListener;
-
-    try {
-      await traceListener.onStartInvocation(event, context);
-      await metricsListener.onStartInvocation(event, context);
-      if (finalConfig.enhancedMetrics) {
-        incrementInvocationsMetric(metricsListener, context);
-      }
-
-      sendQueueMetrics(metricsListener);
-    } catch (err) {
-      if (err instanceof Error) {
-        logDebug("Failed to start listeners", err);
-      }
-    }
-
-    let result: TResult | undefined;
-    let localResult: TResult | undefined;
-    let error: any;
-    let didThrow = false;
-    try {
-      const traceListenerOnWrap = async (...localArgs: any[]) => {
-        const {
-          event: localEvent,
-          context: localContext,
-          responseStream: localResponseStream,
-        } = extractArgs(isResponseStreamFunction, ...localArgs);
-
-        if (isResponseStreamFunction) {
-          responseStream.once("drain", () => {
-            const firstDrainTime = new Date();
-            const timeToFirstByte = firstDrainTime.getTime() - startTime.getTime();
-            metricsListener.sendDistributionMetric(
-              "aws.lambda.enhanced.time_to_first_byte",
-              timeToFirstByte,
-              true,
-              ...getEnhancedMetricTags(context),
-            );
-          });
-        }
-
-        traceListener.onRequestStart(localEvent);
-
-        try {
-          localResult = isResponseStreamFunction
-            ? await promHandler(localEvent, localResponseStream, localContext)
-            : await promHandler(localEvent, localContext);
-        } finally {
-          const responseIs5xxError = traceListener.onEndingInvocation(
-            localEvent,
-            localResult,
-            isResponseStreamFunction,
-          );
-          if (responseIs5xxError) {
-            incrementErrorsMetric(metricsListener, context);
-          }
-          if (isBatchItemFailure(localResult)) {
-            incrementBatchItemFailureMetric(metricsListener, batchItemFailureCount(localResult), context);
-          }
-        }
-        return localResult;
-      };
-
-      result = isResponseStreamFunction
-        ? await traceListener.onWrap(traceListenerOnWrap)(event, responseStream, context)
-        : await traceListener.onWrap(traceListenerOnWrap)(event, context);
-    } catch (err) {
-      didThrow = true;
-      error = err;
-    }
-    try {
-      if (didThrow && finalConfig.enhancedMetrics) {
-        incrementErrorsMetric(metricsListener, context);
-      }
-      await metricsListener.onCompleteInvocation();
-      await traceListener.onCompleteInvocation(error, result, event);
-    } catch (err) {
-      if (err instanceof Error) {
-        logDebug("Failed to complete listeners", err);
-      }
-    }
-    currentMetricsListener = undefined;
-    currentTraceListener = undefined;
-    if (didThrow) {
-      throw error;
-    }
-
-    return result as TResult;
-  };
-
-  (wrappedFunc as any)[_ddWrappedKey] = true;
-
-  if (isResponseStreamFunction) {
-    (wrappedFunc as any)[HANDLER_STREAMING] = STREAM_RESPONSE;
-  }
-
-  return wrappedFunc;
-}
-
-/**
- *
- * @param isResponseStreamFunction A boolean determining if a Lambda Function is Response Stream.
- * @param args Spread arguments of a Lambda Function.
- * @returns An object containing the context and the event of a Lambda Function.
+ * Kept because handler-loading integrations import it. Pure and cheap, so there
+ * is no reason to make callers reimplement it.
  */
 export function extractArgs<TEvent>(isResponseStreamFunction: boolean, ...args: any[]) {
-  const context: Context = isResponseStreamFunction ? args[2] : args.length > 0 ? (args[1] as Context) : {};
+  const context: Context = isResponseStreamFunction
+    ? args[2]
+    : args.length > 0
+    ? (args[1] as Context)
+    : ({} as Context);
   const event: TEvent = args[0];
   const responseStream: any = isResponseStreamFunction ? args[1] : undefined;
   return { context, event, responseStream };
 }
 
-/**
- * Sends a Distribution metric asynchronously to the Datadog API.
- * @param name The name of the metric to send.
- * @param value The value of the metric
- * @param metricTime The timestamp associated with this metric data point.
- * @param tags The tags associated with the metric. Should be of the format "tag:value".
- */
-export function sendDistributionMetricWithDate(name: string, value: number, metricTime: Date, ...tags: string[]) {
-  tags = [...tags, getRuntimeTag(), ...getDDTags()];
-
-  if (currentMetricsListener !== undefined) {
-    currentMetricsListener.sendDistributionMetricWithDate(name, value, metricTime, false, ...tags);
-    return;
-  }
-
-  _metricsQueue.push({ name, value, metricTime, tags });
+/** Returns the Datadog propagation headers for the active invocation. */
+export function getTraceHeaders(): Partial<TraceHeaders> {
+  return getLambdaFacade().getTraceHeaders();
 }
 
 /**
- * Sends a Distribution metric asynchronously to the Datadog API.
- * @param name The name of the metric to send.
- * @param value The value of the metric
- * @param tags The tags associated with the metric. Should be of the format "tag:value".
+ * Reads one environment value.
+ *
+ * Retained because `handler.mjs` needs it before dd-trace is initialized, and
+ * because it has always been exported.
  */
-export function sendDistributionMetric(name: string, value: number, ...tags: string[]) {
-  tags = [...tags, getRuntimeTag()];
-
-  if (currentMetricsListener !== undefined) {
-    currentMetricsListener.sendDistributionMetric(name, value, false, ...tags);
-    return;
-  }
-
-  _metricsQueue.push({ name, value, tags });
-}
-
-function sendQueueMetrics(listener: MetricsListener) {
-  // Reverse the queue to send metrics in order.
-  // This is necessary because the "queue" is a stack,
-  // and we want to send metrics in the order they were added.
-  _metricsQueue.reverse();
-  while (_metricsQueue.length > 0) {
-    const metric = _metricsQueue.pop()!; // This will always exist.
-    const { name, value, metricTime, tags } = metric;
-    if (metricTime !== undefined) {
-      listener.sendDistributionMetricWithDate(name, value, metricTime, false, ...tags);
-      continue;
-    }
-
-    listener.sendDistributionMetric(name, value, false, ...tags);
-  }
-}
-
-/**
- * Retrieves the Datadog headers for the current trace.
- */
-export function getTraceHeaders(): Partial<DatadogTraceHeaders> {
-  if (currentTraceListener === undefined) {
-    return {};
-  }
-  return currentTraceListener.currentTraceHeaders;
-}
-
-function getConfig(userConfig?: Partial<Config>): Config {
-  let config: Config;
-
-  if (userConfig === undefined) {
-    config = defaultConfig;
-  } else {
-    config = {
-      ...defaultConfig,
-      ...userConfig,
-    };
-  }
-  if (config.apiKey === "") {
-    config.apiKey = getEnvValue(apiKeyEnvVar, "");
-  }
-
-  if (config.siteURL === "") {
-    config.siteURL = getEnvValue(siteURLEnvVar, defaultSiteURL);
-  }
-
-  if (config.apiKeyKMS === "") {
-    config.apiKeyKMS = getEnvValue(apiKeyKMSEnvVar, "");
-  }
-
-  if (config.apiKeySecretARN === "") {
-    config.apiKeySecretARN = getEnvValue(apiKeySecretARNEnvVar, "");
-  }
-
-  if (userConfig === undefined || userConfig.injectLogContext === undefined) {
-    const result = getEnvValue(logInjectionEnvVar, "true").toLowerCase();
-    config.injectLogContext = result === "true";
-  }
-
-  if (userConfig === undefined || userConfig.debugLogging === undefined) {
-    const result = getEnvValue(logLevelEnvVar, "ERROR").toLowerCase();
-    config.debugLogging = result === "debug";
-  }
-  if (userConfig === undefined || userConfig.logForwarding === undefined) {
-    const result = getEnvValue(logForwardingEnvVar, "false").toLowerCase();
-    config.logForwarding = result === "true";
-  }
-  if (userConfig === undefined || userConfig.enhancedMetrics === undefined) {
-    const result = getEnvValue(enhancedMetricsEnvVar, "true").toLowerCase();
-    config.enhancedMetrics = result === "true";
-  }
-  if (userConfig === undefined || userConfig.mergeDatadogXrayTraces === undefined) {
-    const result = getEnvValue(mergeXrayTracesEnvVar, "false").toLowerCase();
-    config.mergeDatadogXrayTraces = result === "true";
-  }
-
-  if (userConfig === undefined || userConfig.captureLambdaPayload === undefined) {
-    const result = getEnvValue(captureLambdaPayloadEnvVar, "false").toLowerCase();
-    config.captureLambdaPayload = result === "true";
-  }
-
-  if (userConfig === undefined || userConfig.createInferredSpan === undefined) {
-    const result = getEnvValue(traceManagedServicesEnvVar, "true").toLowerCase();
-    config.createInferredSpan = result === "true";
-  }
-
-  if (userConfig === undefined || userConfig.encodeAuthorizerContext === undefined) {
-    const result = getEnvValue(encodeAuthorizerContextEnvVar, "true").toLowerCase();
-    config.encodeAuthorizerContext = result === "true";
-  }
-
-  if (userConfig === undefined || userConfig.decodeAuthorizerContext === undefined) {
-    const result = getEnvValue(decodeAuthorizerContextEnvVar, "true").toLowerCase();
-    config.decodeAuthorizerContext = result === "true";
-  }
-
-  if (userConfig === undefined || userConfig.minColdStartTraceDuration === undefined) {
-    config.minColdStartTraceDuration = Number(getEnvValue(minColdStartTraceDurationEnvVar, "3"));
-  }
-
-  if (userConfig === undefined || userConfig.minColdStartTraceDuration === undefined) {
-    config.coldStartTraceSkipLib = getEnvValue(coldStartTraceSkipLibEnvVar, "./opentracing/tracer");
-  }
-
-  if (userConfig === undefined || userConfig.captureLambdaPayloadMaxDepth === undefined) {
-    config.captureLambdaPayloadMaxDepth = Number(getEnvValue(captureLambdaPayloadMaxDepthEnvVar, "10"));
-  }
-
-  if (userConfig === undefined || userConfig.localTesting === undefined) {
-    const result = getEnvValue(localTestingEnvVar, "false").toLowerCase();
-    // TODO deprecate 1 for truthy, this shouldn't have been allowed
-    // but the extension allows it, so we must as well
-    // @ts-ignore-next-line
-    config.localTesting = result === "true" || result === "1";
-  }
-
-  if (userConfig === undefined || userConfig.addSpanPointers === undefined) {
-    const result = getEnvValue(addSpanPointersEnvVar, "true").toLowerCase();
-    config.addSpanPointers = result === "true";
-  }
-
-  if (userConfig === undefined || userConfig.dataStreamsEnabled === undefined) {
-    const result = getEnvValue(dataStreamsEnabledEnvVar, "false").toLowerCase();
-    const validEnabledValues = new Set(["true", "1", "yes", "y", "on"]);
-    config.dataStreamsEnabled = validEnabledValues.has(result);
-  }
-
-  if (userConfig === undefined || userConfig.appsecEnabled === undefined) {
-    const result = getEnvValue(appsecEnabledEnvVar, "false").toLowerCase();
-    config.appsecEnabled = result === "true" || result === "1";
-  }
-
-  return config;
-}
-
 export function getEnvValue(key: string, defaultValue: string): string {
-  const val = process.env[key];
-  return val !== undefined ? val : defaultValue;
+  const value = process.env[key];
+  return value !== undefined ? value : defaultValue;
 }
 
-function getRuntimeTag(): string {
-  const version = process.version;
-  return `dd_lambda_layer:datadog-node${version}`;
-}
-
-function getDDTags(): string[] {
-  const ddTags = getEnvValue("DD_TAGS", "").split(",");
-  const ddService = getEnvValue("DD_SERVICE", "");
-  if (ddService.length > 0) {
-    ddTags.push(`service:${ddService}`);
-  }
-  const ddEnv = getEnvValue("DD_ENV", "");
-  if (ddEnv.length > 0) {
-    ddTags.push(`env:${ddEnv}`);
-  }
-  return ddTags;
-}
-
+/**
+ * Reports a handler that could not be loaded.
+ *
+ * Shim-owned because the failure happens during module evaluation, before any
+ * invocation reaches dd-trace's lifecycle — there is no invocation to hang the
+ * error off, so dd-trace cannot observe this on its own. The shim detects it
+ * and dd-trace renders it.
+ */
 export async function emitTelemetryOnErrorOutsideHandler(
   error: Error,
   functionName: string,
   startTime: number,
 ): Promise<void> {
-  if (getEnvValue("DD_TRACE_ENABLED", "true").toLowerCase() === "true") {
-    const options: SpanOptions = {
-      tags: {
-        service: "aws.lambda",
-        operation_name: "aws.lambda",
-        resource_names: functionName,
-        "resource.name": functionName,
-        "span.type": "serverless",
-        "error.status": 500,
-        "error.type": error.name,
-        "error.message": error.message,
-        "error.stack": error.stack,
-      },
-      startTime,
-    };
-    const tracerWrapper = new TracerWrapper();
-    const span = new SpanWrapper(tracerWrapper.startSpan("aws.lambda", options), {});
-    span.finish();
-  }
-
-  const config = getConfig();
-  if (config.enhancedMetrics) {
-    const metricsListener = new MetricsListener(new KMSService(), config);
-    await metricsListener.onStartInvocation(undefined);
-    incrementErrorsMetric(metricsListener);
-    await metricsListener.onCompleteInvocation();
-  }
+  await getLambdaFacade().reportInitFailure({ error, functionName, startTime });
 }
