@@ -55,8 +55,6 @@ interface GlobalConfig {
   forceWrap: boolean;
   /** Custom logger used by the shim-owned loader and failure path. */
   logger?: Logger;
-  /** Custom trace-context extractor, loaded by the shim from `DD_TRACE_EXTRACTOR`. */
-  traceExtractor?: (event: any, context: Context) => Promise<TraceHeaders> | TraceHeaders;
 }
 
 /**

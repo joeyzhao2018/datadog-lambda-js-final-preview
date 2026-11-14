@@ -72,7 +72,7 @@ function tracer(directory, name, { facade = true, register = true } = {}) {
       join(directory, "lambda.js"),
       `globalThis.events ||= [];
        globalThis.events.push('${name}:facade');
-       exports.wrap = handler => handler;
+       exports.wrap = (handler, config) => { globalThis.forwardedConfig = config; return handler; };
        exports.sendDistributionMetric = () => {};
        exports.sendDistributionMetricWithDate = () => {};
        exports.getTraceHeaders = () => ({});
@@ -159,6 +159,93 @@ test("the npm artifact contains unchanged runtime files and no runtime test fixt
   assert.ok(files.includes("dist/runtime/tracer.js"));
   assert.ok(!files.some((file) => file.includes("/fixtures/")));
 });
+
+test("packed extractor declarations accept the current shim contract", () => {
+  const ts = require("typescript");
+  const program = ts.createProgram([join(__dirname, "types/custom-extractor.ts")], {
+    noEmit: true,
+    strict: true,
+    target: ts.ScriptTarget.ES2021,
+    module: ts.ModuleKind.CommonJS,
+    types: [],
+    baseUrl: root,
+    paths: {
+      "datadog-lambda-js": [join(packed, "dist/index.d.ts")],
+      "datadog-lambda-js/dist/facade": [join(packed, "dist/facade.d.ts")],
+      "aws-lambda": [require.resolve("@types/aws-lambda/index.d.ts")],
+      node: [require.resolve("@types/node/index.d.ts")],
+    },
+  });
+  const diagnostics = ts.getPreEmitDiagnostics(program);
+  assert.equal(
+    diagnostics.length,
+    0,
+    ts.formatDiagnostics(diagnostics, {
+      getCurrentDirectory: () => root,
+      getCanonicalFileName: (name) => name,
+      getNewLine: () => "\n",
+    }),
+  );
+});
+
+test("manual wrapping forwards the current shim extractor contract unchanged", () => {
+  fixture().run(`
+    const { datadog } = require('datadog-lambda-js');
+    for (const legacy of [false, true]) {
+      for (const sampleMode of [-1, 0, 1, 2]) {
+        for (const source of ['xray', 'event', 'ddtrace']) {
+          const result = { sampleMode, source, ...(legacy
+            ? { traceID: '1234', parentID: '5678' }
+            : { traceId: '1234', parentId: '5678' }) };
+          const event = {};
+          const context = { awsRequestId: 'request-id' };
+          const extractor = (receivedEvent, receivedContext) => {
+            assert.equal(receivedEvent, event);
+            assert.equal(receivedContext, context);
+            return result;
+          };
+          for (const traceExtractor of [extractor, async (...args) => extractor(...args)]) {
+            const config = { traceExtractor };
+            datadog(() => {}, config);
+            assert.equal(globalThis.forwardedConfig, config);
+            assert.equal(globalThis.forwardedConfig.traceExtractor, traceExtractor);
+            assert.equal(await globalThis.forwardedConfig.traceExtractor(event, context), result);
+          }
+        }
+      }
+    }
+  `);
+});
+
+for (const esm of [false, true]) {
+  for (const asynchronous of [false, true]) {
+    test(`DD_TRACE_EXTRACTOR forwards the loaded function (ESM: ${esm}, async: ${asynchronous})`, () => {
+      const setup = fixture();
+      const filename = esm ? "extractor.mjs" : "extractor.cjs";
+      write(
+        join(setup.directory, filename),
+        `${esm ? "export const extract" : "exports.extract"} = ${asynchronous ? "async" : ""} (event, context) => {
+          if (context.awsRequestId !== 'request-id') throw new Error('context was not forwarded');
+          return event.traceContext;
+        };`,
+      );
+      setup.run(
+        `
+        await import(handlerUrl);
+        const loaded = await import(pathToFileURL(require('node:path').join(process.cwd(), '${filename}')).href);
+        assert.equal(globalThis.forwardedConfig.traceExtractor, loaded.extract);
+        for (const ids of [{ traceId: '1234', parentId: '5678' }, { traceID: '1234', parentID: '5678' }]) {
+          const traceContext = { ...ids, sampleMode: 2, source: 'event' };
+          assert.equal(await globalThis.forwardedConfig.traceExtractor(
+            { traceContext }, { awsRequestId: 'request-id' }
+          ), traceContext);
+        }
+      `,
+        { env: { DD_TRACE_EXTRACTOR: "extractor.extract" } },
+      );
+    });
+  }
+}
 
 test("the packed CJS handler initializes and wraps with the same function-local tracer", () => {
   const setup = fixture();

@@ -16,6 +16,20 @@ export interface TraceHeaders {
   "x-datadog-sampling-priority": string;
 }
 
+/** The custom extractor result accepted by datadog-lambda-js. */
+export interface TraceContext {
+  /** @deprecated use `traceId` */
+  traceID?: string;
+  /** @deprecated use `parentId` */
+  parentID?: string;
+  traceId?: string;
+  parentId?: string;
+  sampleMode: -1 | 0 | 1 | 2;
+  source: "xray" | "event" | "ddtrace";
+}
+
+export type TraceExtractor = (event: any, context: Context) => Promise<TraceContext> | TraceContext;
+
 /**
  * Per-handler configuration accepted by `datadog()`.
  *
@@ -44,7 +58,8 @@ export interface LambdaConfig {
   appsecEnabled: boolean;
   siteURL: string;
   forceWrap: boolean;
-  traceExtractor: (event: any, context: Context) => Promise<TraceHeaders> | TraceHeaders;
+  /** Custom trace-context extractor, optionally loaded by `DD_TRACE_EXTRACTOR`. */
+  traceExtractor: TraceExtractor;
 }
 
 /** Details of a handler that could not be loaded. */
