@@ -69,7 +69,7 @@ function tracer(directory, name, { facade = true, register = true } = {}) {
   );
   if (facade) {
     write(
-      join(directory, "lambda.js"),
+      join(directory, "packages/dd-trace/src/lambda/facade.js"),
       `globalThis.events ||= [];
        globalThis.events.push('${name}:facade');
        exports.wrap = (handler, config) => { globalThis.forwardedConfig = config; return handler; };
@@ -247,6 +247,16 @@ for (const esm of [false, true]) {
   }
 }
 
+test("the shim loads the internal bridge without a public Lambda entry point", () => {
+  fixture().run(`
+    assert.throws(() => require.resolve('dd-trace/lambda'), { code: 'MODULE_NOT_FOUND' });
+    const { datadog } = require('datadog-lambda-js');
+    const original = () => 'result';
+    assert.equal(datadog(original), original);
+    assert.deepEqual(globalThis.events, ['local:facade']);
+  `);
+});
+
 test("the packed CJS handler initializes and wraps with the same function-local tracer", () => {
   const setup = fixture();
   setup.run(`
@@ -270,7 +280,7 @@ for (const facadeFirst of [false, true]) {
     fixture({ facade: false }).run(`
       const { datadog } = require('datadog-lambda-js');
       ${facadeFirst ? "" : "await importer.initTracer();"}
-      assert.throws(() => datadog(() => {}), /could not load "dd-trace\\/lambda"/);
+      assert.throws(() => datadog(() => {}), /could not load.*packages\\/dd-trace\\/src\\/lambda\\/facade/);
       ${facadeFirst ? "await importer.initTracer();" : ""}
       assert.ok(globalThis.events.includes('local:init'));
       assert.ok(globalThis.events.every(event => event.startsWith('local:')));
@@ -280,7 +290,7 @@ for (const facadeFirst of [false, true]) {
 
 test("constants-only imports stay lazy and the facade still checks all required methods", () => {
   const setup = fixture();
-  write(join(setup.localTracer, "lambda.js"), "exports.wrap = handler => handler;");
+  write(join(setup.localTracer, "packages/dd-trace/src/lambda/facade.js"), "exports.wrap = handler => handler;");
   setup.run(`
     const shim = require('datadog-lambda-js');
     assert.equal(shim.datadogHandlerEnvVar, 'DD_LAMBDA_HANDLER');

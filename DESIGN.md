@@ -101,7 +101,7 @@ its message and stack. Records now keep the shim's `message` and put the error
 under an `error` key, serialized wherever it appears. Upstream's `log.spec.ts`
 asserts the old shape, so its expectations change when it is ported.
 
-## The `dd-trace/lambda` contract
+## The internal Lambda bridge contract
 
 Five functions, identical on `master` / `v6.x` / `v5.x`, asserted against the
 packed tarball on all three lines:

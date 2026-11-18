@@ -71,7 +71,7 @@ export interface InitFailure {
 }
 
 /**
- * The `dd-trace/lambda` contract.
+ * The internal Lambda bridge used only by datadog-lambda-js.
  *
  * This surface is identical on dd-trace `master`, `v6.x` and `v5.x`, and is
  * asserted against the packed tarball on all three lines. It is the only thing
@@ -89,10 +89,10 @@ export interface LambdaFacade {
   reportInitFailure(failure: InitFailure): Promise<void>;
 }
 
-/** Minimum dd-trace versions that export `dd-trace/lambda`. */
+/** Tracer versions that provide the internal Lambda bridge. */
 export const REQUIRED_DD_TRACE = "^5.x (Node 18/20) or ^6.x (Node 22+)";
 
-const FACADE_MODULE = "dd-trace/lambda";
+const FACADE_MODULE = "./packages/dd-trace/src/lambda/facade";
 const REQUIRED_METHODS: (keyof LambdaFacade)[] = [
   "wrap",
   "sendDistributionMetric",
@@ -121,7 +121,7 @@ export function getLambdaFacade(): LambdaFacade {
   try {
     const tracerRequire = createRequire(resolveTracerPath());
     // eslint-disable-next-line @typescript-eslint/no-var-requires
-    resolved = tracerRequire("./lambda");
+    resolved = tracerRequire(FACADE_MODULE);
   } catch (error) {
     throw new Error(
       `datadog-lambda-js could not load "${FACADE_MODULE}". ` +
