@@ -101,7 +101,7 @@ volume — listing them is more useful than copying them:
 
 ## Honest caveat
 
-`facade.ts` assumes a five-function `dd-trace/lambda`. The fifth
+`facade.ts` assumes a five-function internal Lambda bridge. The fifth
 (`reportInitFailure`) is now reserved on the facade — decision A resolved in
 its favor — but as a throwing stub until the metrics pipeline lands (PR 12).
 So this preview compiles and its surface checks out, but it would not *run*
