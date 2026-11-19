@@ -1,10 +1,12 @@
 const Module = require("node:module");
-const { dirname, join } = require("node:path");
+const { dirname, join, resolve } = require("node:path");
 const { fileURLToPath, pathToFileURL } = require("node:url");
 
 const { logDebug } = require("../utils");
 const { resolveTracerPath } = require("./tracer");
 
+// Keep runtime loads native when this helper is included in a bundle.
+const nodeRequire = Module.createRequire(typeof __filename === "string" ? __filename : resolve("package.json"));
 let loaderRegistration;
 
 function preloadPaths(arguments_, flags) {
@@ -23,7 +25,7 @@ function preloadPaths(arguments_, flags) {
 function isSelectedLoader(specifier, tracerDirectory, filename) {
     try {
         const path = specifier.startsWith("file:") ? fileURLToPath(specifier) : specifier;
-        return require.resolve(path, { paths: [process.cwd()] }) === join(tracerDirectory, filename);
+        return nodeRequire.resolve(path, { paths: [process.cwd()] }) === join(tracerDirectory, filename);
     } catch {
         return false;
     }
@@ -39,7 +41,7 @@ async function registerESMLoaderHooks(tracerPath) {
 
     const tracerDirectory = dirname(tracerPath);
     const registerPath = join(tracerDirectory, "register.js");
-    if (require.cache[registerPath]?.loaded) return;
+    if (nodeRequire.cache[registerPath]?.loaded) return;
     const nodeOptions = process.env.NODE_OPTIONS?.match(/(?:[^\s"]+|"[^"]*")+/g) || [];
     const arguments_ = [...nodeOptions, ...process.execArgv];
     const loaders = preloadPaths(arguments_, ["--loader", "--experimental-loader"]);
@@ -54,7 +56,7 @@ async function registerESMLoaderHooks(tracerPath) {
             return;
         }
         try {
-            require(registerPath);
+            nodeRequire(registerPath);
         } catch (error) {
             const registerMissing = error?.code === "MODULE_NOT_FOUND" &&
                 error.message?.startsWith(`Cannot find module '${registerPath}'`);
@@ -81,7 +83,7 @@ exports.initTracer = async function () {
     const tracerPath = resolveTracerPath();
     // `_dd.origin: lambda` is set by the dd-trace Lambda plugin on the span
     // itself now, so there is nothing to inject into DD_TAGS here.
-    const tracer = require(tracerPath).init();
+    const tracer = nodeRequire(tracerPath).init();
     logDebug("automatically initialized dd-trace");
 
     // The extension blocklist moved into the dd-trace Lambda plugin defaults:
