@@ -35,13 +35,12 @@ function isSelectedLoader(specifier, tracerDirectory, filename) {
  * @param {string} tracerPath
  */
 async function registerESMLoaderHooks(tracerPath) {
-    if (typeof Module.register !== "function") {
+    if (typeof Module.registerHooks !== "function" && typeof Module.register !== "function") {
         return;
     }
 
     const tracerDirectory = dirname(tracerPath);
     const registerPath = join(tracerDirectory, "register.js");
-    if (nodeRequire.cache[registerPath]?.loaded) return;
     const nodeOptions = process.env.NODE_OPTIONS?.match(/(?:[^\s"]+|"[^"]*")+/g) || [];
     const arguments_ = [...nodeOptions, ...process.execArgv];
     const loaders = preloadPaths(arguments_, ["--loader", "--experimental-loader"]);
@@ -52,9 +51,25 @@ async function registerESMLoaderHooks(tracerPath) {
     const imports = preloadPaths(arguments_, ["--import"]);
     try {
         if (imports.some((specifier) => isSelectedLoader(specifier, tracerDirectory, "initialize.mjs"))) {
-            await import(pathToFileURL(join(tracerDirectory, "initialize.mjs")).href);
+            await import(/* webpackIgnore: true */ pathToFileURL(join(tracerDirectory, "initialize.mjs")).href);
             return;
         }
+        // Resolve before importing: a missing dependency inside register.mjs must not
+        // be mistaken for an older tracer without this entry point.
+        let esmRegisterPath;
+        try {
+            esmRegisterPath = nodeRequire.resolve(join(tracerDirectory, "register.mjs"));
+        } catch (error) {
+            if (error?.code !== "MODULE_NOT_FOUND") throw error;
+        }
+        if (esmRegisterPath) {
+            // Native import works when Lambda disables require(esm). Await hook
+            // installation before the extractor or customer handler is evaluated.
+            await import(/* webpackIgnore: true */ pathToFileURL(esmRegisterPath).href);
+            logDebug("registered dd-trace ESM loader hooks for ESM instrumentation");
+            return;
+        }
+        if (nodeRequire.cache[registerPath]?.loaded) return;
         try {
             nodeRequire(registerPath);
         } catch (error) {
@@ -63,7 +78,11 @@ async function registerESMLoaderHooks(tracerPath) {
             if (!registerMissing) {
                 throw error;
             }
-            Module.register(pathToFileURL(join(tracerDirectory, "loader-hook.mjs")));
+            if (typeof Module.register === "function") {
+                Module.register(pathToFileURL(join(tracerDirectory, "loader-hook.mjs")));
+            } else {
+                return;
+            }
         }
         logDebug("registered dd-trace ESM loader hooks for ESM instrumentation");
     } catch (error) {

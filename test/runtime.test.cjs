@@ -59,7 +59,7 @@ export async function load(url, context, nextLoad) {
 }
 `;
 
-function tracer(directory, name, { facade = true, register = true } = {}) {
+function tracer(directory, name, { facade = true, register = true, esmRegister = false } = {}) {
   write(join(directory, "package.json"), JSON.stringify({ name: "dd-trace", version: "6.12.0", main: "index.js" }));
   write(
     join(directory, "index.js"),
@@ -104,9 +104,48 @@ function tracer(directory, name, { facade = true, register = true } = {}) {
        register('./loader-hook.mjs', import.meta.url);
      }`,
   );
+  if (esmRegister) {
+    write(join(directory, "registration-state.cjs"), "exports.registered = false;");
+    write(
+      join(directory, "sync-loader.mjs"),
+      loader.replace("async function", "function").replace("await nextLoad", "nextLoad"),
+    );
+    write(
+      join(directory, "register.js"),
+      `const state = require('./registration-state.cjs');
+       if (require('node:worker_threads').isMainThread && !state.registered) {
+         globalThis.events ||= [];
+         globalThis.events.push('${name}:register');
+         require('node:module').register(require('node:url').pathToFileURL(__dirname + '/loader-hook.mjs'));
+         state.registered = true;
+       }`,
+    );
+    write(
+      join(directory, "register.mjs"),
+      `import Module from 'node:module';
+       import state from './registration-state.cjs';
+       await new Promise(setImmediate);
+       if (!state.registered) {
+         globalThis.events ||= [];
+         globalThis.events.push('${name}:register-mjs');
+         if (typeof Module.registerHooks === 'function') {
+           const { load } = await import('./sync-loader.mjs');
+           Module.registerHooks({ load });
+         } else {
+           Module.register('./loader-hook.mjs', import.meta.url);
+         }
+         state.registered = true;
+       }`,
+    );
+    write(
+      join(directory, "initialize.mjs"),
+      `export { load } from './loader-hook.mjs';
+       if ((await import('node:worker_threads')).isMainThread) await import('./register.mjs');`,
+    );
+  }
 }
 
-function fixture({ local = true, facade = true, register = true } = {}) {
+function fixture({ local = true, facade = true, register = true, esmRegister = false } = {}) {
   const installation = mkdtempSync(join(temporary, "installation-"));
   const directory = join(installation, "task");
   const shim = join(directory, "node_modules/datadog-lambda-js");
@@ -117,8 +156,8 @@ function fixture({ local = true, facade = true, register = true } = {}) {
     dirname(require.resolve("serialize-error/package.json")),
     join(directory, "node_modules/serialize-error"),
   );
-  if (local) tracer(localTracer, "local", { facade, register });
-  tracer(join(layer, "dd-trace"), "layer");
+  if (local) tracer(localTracer, "local", { facade, register, esmRegister });
+  tracer(join(layer, "dd-trace"), "layer", { esmRegister });
   write(join(directory, "customer.mjs"), "export const handler = async () => globalThis.loaderTouches;");
   write(join(directory, "commonjs.cjs"), "exports.handler = async () => 'cjs result';");
   return {
@@ -311,6 +350,104 @@ const loadOnce = `
 test("explicit registration happens before ESM customer evaluation and is idempotent", () => {
   fixture().run(loadOnce + "assert.equal(globalThis.events.filter(event => event === 'local:register').length, 1);");
 });
+
+const withoutRequireESM = process.allowedNodeEnvironmentFlags.has("--no-experimental-require-module")
+  ? ["--no-experimental-require-module"]
+  : [];
+
+test("register.mjs is awaited before customer evaluation with require(esm) disabled", () => {
+  fixture({ esmRegister: true }).run(
+    loadOnce +
+      `
+    assert.equal(globalThis.events.filter(event => event === 'local:register-mjs').length, 1);
+    assert.ok(!globalThis.events.includes('local:register'));
+  `,
+    { flags: withoutRequireESM },
+  );
+});
+
+test("concurrent startup calls share ESM registration", () => {
+  fixture({ esmRegister: true }).run(
+    `
+    await Promise.all([importer.initTracer(), importer.initTracer()]);
+    const { handler } = await import(handlerUrl);
+    assert.equal(await handler(), 1);
+    assert.equal(globalThis.events.filter(event => event === 'local:register-mjs').length, 1);
+    assert.ok(!globalThis.events.includes('local:register'));
+  `,
+    { flags: withoutRequireESM },
+  );
+});
+
+test(
+  "register.mjs works after module.register is removed",
+  {
+    skip: typeof require("node:module").registerHooks !== "function",
+  },
+  () => {
+    fixture({ esmRegister: true }).run(
+      `
+    delete require('node:module').register;
+    ${loadOnce}
+    assert.ok(globalThis.events.includes('local:register-mjs'));
+  `,
+      { flags: withoutRequireESM },
+    );
+  },
+);
+
+test("a broken register.mjs does not fall back to register.js", () => {
+  const setup = fixture({ esmRegister: true });
+  write(join(setup.localTracer, "register.mjs"), "import './missing-internal-dependency.mjs';");
+  setup.run(
+    `
+    const { handler } = await import(handlerUrl);
+    assert.equal(await handler(), undefined);
+    assert.ok(!globalThis.events.includes('local:register'));
+  `,
+    { flags: withoutRequireESM },
+  );
+});
+
+test(
+  "a CommonJS preload that installed no hooks does not suppress register.mjs",
+  {
+    skip: typeof require("node:module").registerHooks !== "function",
+  },
+  () => {
+    const setup = fixture({ esmRegister: true });
+    write(join(setup.localTracer, "register.js"), "// No hooks can be installed through require(esm).\n");
+    setup.run(
+      `
+    delete require('node:module').register;
+    require('dd-trace/register.js');
+    ${loadOnce}
+    assert.ok(globalThis.events.includes('local:register-mjs'));
+  `,
+      { flags: withoutRequireESM },
+    );
+  },
+);
+
+for (const preload of ["register.js", "register.mjs", "initialize.mjs"]) {
+  for (const source of ["ignored environment", "environment", "command line"]) {
+    test(`modern tracer ${preload}: ${source} registers exactly once`, () => {
+      const setup = fixture({ esmRegister: true });
+      const flag = preload === "register.js" ? "--require" : "--import";
+      const option = `${flag}=${pathToFileURL(join(setup.localTracer, preload)).href}`;
+      // --require accepts filesystem paths rather than file URLs.
+      const preloadOption = preload === "register.js" ? `${flag}=${join(setup.localTracer, preload)}` : option;
+      setup.run(
+        (source === "ignored environment" ? `process.env.NODE_OPTIONS = ${JSON.stringify(preloadOption)};` : "") +
+          loadOnce,
+        {
+          flags: [...withoutRequireESM, ...(source === "command line" ? [preloadOption] : [])],
+          env: source === "environment" ? { NODE_OPTIONS: preloadOption } : {},
+        },
+      );
+    });
+  }
+}
 
 for (const preload of ["register.js", "initialize.mjs"]) {
   for (const source of ["ignored environment", "environment", "command line"]) {
