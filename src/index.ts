@@ -1,5 +1,7 @@
 import { Context, Handler } from "aws-lambda";
 
+import { datadogLambdaVersion } from "./constants";
+
 import { getLambdaFacade, LambdaConfig, TraceHeaders } from "./facade";
 import { Logger, LogLevel, setLogger, setLogLevel } from "./utils";
 
@@ -91,7 +93,7 @@ export function datadog<TEvent, TResult>(
     setLogger(config.logger);
   }
 
-  return getLambdaFacade().wrap(handler, config);
+  return getLambdaFacade().wrap(handler, { ...config, datadogLambdaVersion });
 }
 
 /** Submits a custom distribution metric. */
