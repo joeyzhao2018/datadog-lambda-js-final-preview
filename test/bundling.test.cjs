@@ -50,7 +50,11 @@ function tracer(directory, name) {
     exports.use = () => { globalThis.events.push('${name}:http'); return exports; };
   `,
   );
-  write(join(directory, "register.js"), `globalThis.events.push('${name}:register');`);
+  write(join(directory, "register.js"), `throw new Error('register.mjs must be preferred');`);
+  write(
+    join(directory, "register.mjs"),
+    `await new Promise(setImmediate); globalThis.events.push('${name}:register');`,
+  );
   write(
     join(directory, "packages/dd-trace/src/lambda/facade.js"),
     `
