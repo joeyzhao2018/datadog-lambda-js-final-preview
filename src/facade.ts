@@ -81,7 +81,7 @@ export interface InitFailure {
 export interface LambdaFacade {
   wrap<TEvent, TResult>(
     handler: Handler<TEvent, TResult> | any,
-    config?: Partial<LambdaConfig>,
+    config?: Partial<LambdaConfig> & { datadogLambdaVersion?: string },
   ): Handler<TEvent, TResult> | any;
   sendDistributionMetric(name: string, value: number, ...tags: string[]): void;
   sendDistributionMetricWithDate(name: string, value: number, metricTime: Date, ...tags: string[]): void;

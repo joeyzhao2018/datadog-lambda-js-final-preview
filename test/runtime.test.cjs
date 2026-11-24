@@ -207,13 +207,28 @@ test("manual wrapping forwards the current shim extractor contract unchanged", (
           for (const traceExtractor of [extractor, async (...args) => extractor(...args)]) {
             const config = { traceExtractor };
             datadog(() => {}, config);
-            assert.equal(globalThis.forwardedConfig, config);
+            assert.notEqual(globalThis.forwardedConfig, config);
+            const { datadogLambdaVersion, ...forwarded } = globalThis.forwardedConfig;
+            assert.equal(datadogLambdaVersion, require('datadog-lambda-js/dist/constants').datadogLambdaVersion);
+            assert.deepEqual(forwarded, config);
             assert.equal(globalThis.forwardedConfig.traceExtractor, traceExtractor);
             assert.equal(await globalThis.forwardedConfig.traceExtractor(event, context), result);
           }
         }
       }
     }
+  `);
+});
+
+test("wrapping forwards the shim-owned published layer version without changing caller configuration", () => {
+  fixture().run(`
+    const { datadog } = require('datadog-lambda-js');
+    const { datadogLambdaVersion } = require('datadog-lambda-js/dist/constants');
+    const config = { datadogLambdaVersion: 'caller-value', captureLambdaPayload: true };
+    datadog(() => {}, config);
+    assert.equal(globalThis.forwardedConfig.datadogLambdaVersion, datadogLambdaVersion);
+    assert.equal(globalThis.forwardedConfig.captureLambdaPayload, true);
+    assert.deepEqual(config, { datadogLambdaVersion: 'caller-value', captureLambdaPayload: true });
   `);
 });
 
